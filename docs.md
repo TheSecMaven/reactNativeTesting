@@ -1,157 +1,139 @@
-# Hitachi Ops Center: Entity Relationship & API Mapping Guide
+Excellent — this question breaks into two logical parts:
+(1) **Operational discovery:** how to determine replication status and provisioning parameters from an existing host + LDEV pair, and
+(2) **Data modeling:** how to persist those attributes and relationships in your own schema or data lake.
 
-This document explains the logical relationships among Ops Center entities — from servers to storage arrays — and how to query each relationship through the **Admin API** and **Configuration Manager REST (CMREST)**.
-
-Use it to quickly understand *what connects to what*, *which endpoints to call*, and *how to traverse a full server-to-LDEV topology.*
-
----
-
-## 🔍 Core Concept
-
-Ops Center models storage infrastructure as interconnected entities:
-
-* **Servers** consume **LDEVs (Volumes)** presented through **Host Groups** on **Ports** of **Storage Systems (Arrays)**.
-* **LDEVs** reside in **Pools** and **Parity Groups** that belong to a **Storage System**.
-* **LU Paths (LUNs)** form the many-to-many join between Host Groups and LDEVs.
-
-The diagram below shows both relationships and where to fetch each entity.
+Below is a compact, expert-level explanation written for engineers already familiar with Hitachi Ops Center (Admin & CMREST) and Hitachi replication technologies (GAD / TrueCopy / ShadowImage).
 
 ---
 
-## 🧭 Relationship Overview
+# 🧭 Part 1 — Determine replication and provisioning context
 
-```mermaid
-erDiagram
-  STORAGE_SYSTEM ||--o{ POOL : "has"
-  STORAGE_SYSTEM ||--o{ PARITY_GROUP : "has"
-  POOL ||--o{ VOLUME : "allocates (LDEV)"
-  PARITY_GROUP ||--o{ VOLUME : "contains"
-  STORAGE_SYSTEM ||--o{ PORT : "has"
-  PORT ||--o{ HOST_GROUP : "hosts (HG / iSCSI Target)"
-  HOST_GROUP }o--o{ VOLUME : "presents_as (via LU Path / LUN)"
-  HOST_GROUP ||--o{ INITIATOR : "includes (WWPN / IQN / NQN)"
-  SERVER ||--o{ ATTACHED_VOLUME : "sees (per-path)"
-  ATTACHED_VOLUME }o--|| VOLUME : "is"
+### Step 1 — Identify host ↔ LDEV link
+
+Use **Admin API** to confirm presentation:
+
+```http
+GET /v1/compute/servers/attached-volumes/?q=serverId:{serverId}
 ```
 
----
+→ returns `volumeId`, `storageSystemId`, `lun`, `storagePortId`, `hostGroupId`.
+Then:
 
-## 🧩 API Endpoints by Entity
+```http
+GET /v1/storage-systems/{sid}/volumes/{volumeId}
+```
 
-| Entity                       | Description                         | Admin API                                 | CMREST Search                          | Notes                           |
-| ---------------------------- | ----------------------------------- | ----------------------------------------- | -------------------------------------- | ------------------------------- |
-| **Storage System**           | Arrays managed by Ops Center        | `/v1/storage-systems`                     | `storageSystem`                        | Parent object for all resources |
-| **Pool**                     | Thin or DP pools providing capacity | `/v1/storage-systems/{sid}/pools`         | `pool`                                 | Linked to LDEVs                 |
-| **Parity Group**             | RAID-level groupings                | `/v1/storage-systems/{sid}/parity-groups` | `parityGroup`                          | For thick-provisioned LDEVs     |
-| **Volume (LDEV)**            | Logical devices / volumes           | `/v1/storage-systems/{sid}/volumes`       | `ldev`, `virtualLdev`                  | Core data entity                |
-| **Port**                     | Front-end storage ports             | `/v1/storage-systems/{sid}/storage-ports` | `port`                                 | Interface to host groups        |
-| **Host Group (HG / Target)** | Presentation container per port     | `/v1/storage-systems/{sid}/host-groups`   | `hostGroup`                            | 1:1 with port                   |
-| **LU Path / LUN**            | Connection between HG and LDEV      | `POST /v1/volume-manager/edit-lun-paths`  | `lun`, `lu-path`                       | Defines presentation            |
-| **Initiator**                | Host WWPNs, IQNs, NQNs              | —                                         | `wwn`, `iscsi`, `hostWwn`, `hostIscsi` | Registered initiators           |
-| **Server**                   | Discovered hosts                    | `/v1/compute/servers`                     | —                                      | Shows OS and HBAs               |
-| **Attached Volume**          | Server-visible paths to LDEVs       | `/v1/compute/servers/attached-volumes`    | —                                      | Joins Server ↔ Volume           |
+→ includes `replicationType`, `replicationGroupId`, `isPrimary`, and `pairedStorageSystemId`.
 
 ---
 
-## How to Traverse Relationships
+### Step 2 — Check replication status
 
-### From a Server
+**Admin API (volume attributes)**
 
-1. **List servers**
+| Key                     | Meaning                                                            |
+| ----------------------- | ------------------------------------------------------------------ |
+| `replicationType`       | `None`, `TrueCopy`, `UniversalReplicator`, `ShadowImage`, or `GAD` |
+| `replicationRole`       | `Primary` / `Secondary` / `Duplex`                                 |
+| `replicationGroupId`    | group membership across LDEVs                                      |
+| `pairedStorageSystemId` | target array ID                                                    |
+| `pairVolumeId`          | partner LDEV on remote array                                       |
 
-   ```bash
-   GET /v1/compute/servers
-   ```
+**CMREST (Config Mgr Search):**
 
-2. **Get volumes attached to a server**
+```http
+POST /ConfigurationManager/v1/objects/replication
+```
 
-   ```bash
-   GET /v1/compute/servers/attached-volumes/?q=serverId:{serverId}
-   ```
+Search `replicationType:truecopy` or `gad` for deeper state (`pairStatus`, `consistencyGroupId`, `journalId`).
 
-   → Returns `storageSystemId`, `volumeId`, `storagePortId`, `hostGroupId`, and `lun`.
-
-3. **Query volumes and host groups**
-
-   ```bash
-   GET /v1/storage-systems/{sid}/volumes
-   GET /v1/storage-systems/{sid}/host-groups
-   GET /v1/storage-systems/{sid}/storage-ports
-   ```
-
-4. **(Optional) Deep lookup via CMREST**
-
-   ```bash
-   Search: lun, hostGroup, port, wwn, iscsi
-   ```
-
-   → Retrieves detailed LU Path and initiator mappings.
-
----
-
-## CLI Verification (CCI)
-
-From a CCI Command Device host:
+**CCI verification:**
 
 ```bash
-raidcom get port -key detail
-raidcom get host_grp -port CL1-A
-raidcom get lun -port CL1-A
-raidcom get ldev -ldev_id 00:1234
+raidcom get pair -ldev_id 00:1234
 ```
 
-Use these to validate the API data directly on the array.
+→ Shows pair type, role, status, and secondary LDEV.
 
 ---
 
-## Cardinality Quick View
+### Step 3 — If server is *not* replicated
 
-| Relationship                      | Type | Description                |
-| --------------------------------- | ---- | -------------------------- |
-| Array → Pool / Port / ParityGroup | 1→N  | Core grouping              |
-| Pool / ParityGroup → LDEV         | 1→N  | Capacity source            |
-| HostGroup ↔ LDEV                  | N↔N  | Presentation (via LU Path) |
-| HostGroup → Initiator             | 1→N  | Registered initiators      |
-| Server → Attached Volume          | 1→N  | Paths visible to host      |
-| Attached Volume → LDEV            | N→1  | Host–LUN binding           |
+Provisioning requires these data elements:
 
----
+| Category          | Example Attributes                                            | Source                                 |
+| ----------------- | ------------------------------------------------------------- | -------------------------------------- |
+| **Array context** | `storageSystemId`, model, serial                              | Admin `/storage-systems`               |
+| **Pool / Parity** | `poolId`, `parityGroupId`, RAID level, capacity               | Admin `/pools`, `/parity-groups`       |
+| **Front-end**     | `storagePortId`, `hostGroupId`, `hostMode`, `hostModeOptions` | Admin `/storage-ports`, `/host-groups` |
+| **Presentation**  | `lunId`, `pathCount`                                          | Admin `attached-volumes`               |
+| **Server meta**   | `serverId`, `osType`, `wwpn`/`iqn`                            | Admin `/compute/servers`               |
 
-## Reference Docs
-
-* [Hitachi Ops Center Admin REST API Guide (latest)](https://knowledge.hitachivantara.com/Documents/Management_Software/Ops_Center/API)
-* [Hitachi Configuration Manager REST API Reference](https://knowledge.hitachivantara.com/Documents/Management_Software/Ops_Center/Configuration_Manager)
-* [Ops Center Common Services Overview](https://knowledge.hitachivantara.com/Documents/Management_Software/Ops_Center/Common_Services)
-* [Command Control Interface (CCI) Manual](https://knowledge.hitachivantara.com/Documents/Management_Software/Command_Control_Interface)
+Use these when calling `POST /v1/storage-systems/{sid}/volumes` and then mapping via `edit-lun-paths`.
 
 ---
 
-## Summary
+### Step 4 — If server is replicated
 
-* **Admin API** = high-level operational model (servers ↔ arrays).
-* **CMREST** = array-native model (LUNs, host groups, ports, initiators).
-* **CCI** = on-array CLI for validation or automation.
+Determine replication configuration first:
 
-Together, they form the full topology chain:
+| Replication Type               | Key APIs / Attributes                                               | Typical Partner Info                                      |
+| ------------------------------ | ------------------------------------------------------------------- | --------------------------------------------------------- |
+| **TrueCopy**                   | CMREST `replicationType:truecopy`; Admin `replicationType=TRUECOPY` | `primaryLdevId`, `secondaryStorageSystemId`, `pairStatus` |
+| **Universal Replicator (UR)**  | CMREST `replicationType:universalreplicator`                        | Adds `journalId`, `muNumber`, `deltaTime`                 |
+| **ShadowImage (SI)**           | CMREST `replicationType:shadowimage`                                | `copyGroupName`, `splitStatus`                            |
+| **Global-Active Device (GAD)** | CMREST `replicationType:gad`                                        | `clusterId`, `pathGroupId`, `mirrorStatus`                |
 
-**Server → Attached Volumes → Host Groups → Ports → LDEVs → Pools / Parity Groups → Array.**
+**Provisioning for replicated volumes** adds these data elements:
 
-## Glossary of Relationship Terms
+* **Primary array info:** `storageSystemId`, `poolId`, `ldevId`
+* **Secondary array info:** `pairedStorageSystemId`, `pairedPoolId`
+* **Replication group/journal:** `replicationGroupId`, `journalId`, `consistencyGroupId`
+* **Replication mode:** sync/async, `pairStatus`, `role`
+* **Copy method:** `replicationType`
+* **Path policy:** same number of paths/host groups on both arrays
+* **CCI verification:** `raidcom get pair -ldev_id {id}` (confirm `PAIR` state = `PAIR/PAIR-SYNC`)
 
-|                Symbol               | Term                             | Definition                                                                                                                                                                                                        |
-| :---------------------------------: | :------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-|              **1 → 1**              | *One-to-One*                     | Each entity on one side is related to exactly one entity on the other side. Example: a **Port** belongs to exactly one **Storage System**.                                                                        |
-|              **1 → N**              | *One-to-Many*                    | One entity can relate to multiple others. Example: a **Storage System** has many **Ports** or **Pools**.                                                                                                          |
-|              **N → 1**              | *Many-to-One*                    | The inverse of one-to-many; multiple entities reference a single parent. Example: many **LDEVs** belong to one **Pool**.                                                                                          |
-|              **M ↔ N**              | *Many-to-Many*                   | Entities on both sides can have multiple relationships with each other. Example: **Host Groups** and **LDEVs** — each host group can present multiple LDEVs, and each LDEV can be mapped to multiple host groups. |
-|      **LU Path / LUN Mapping**      | *Join Relationship*              | A linking construct that realizes the many-to-many relationship between Host Groups and LDEVs. It defines which LDEV is presented to which host group and under what LUN ID.                                      |
-|              **Entity**             | *Logical Object Type*            | A distinct class of object in Ops Center, such as a Storage System, Port, Host Group, or LDEV. Each entity type has its own API endpoint.                                                                         |
-|           **Cardinality**           | *Relationship Count*             | The number of possible relationships between instances of two entities (e.g., one host group may have many LDEVs).                                                                                                |
-|              **CMREST**             | *Configuration Manager REST API* | Low-level, array-native API exposing detailed object relationships (ports, host groups, LUNs, initiators).                                                                                                        |
-|            **Admin API**            | *Ops Center Admin REST API*      | High-level API providing an integrated view across servers, volumes, and arrays.                                                                                                                                  |
-| **CCI (Command Control Interface)** | *CLI Toolkit*                    | On-array CLI used to query or modify storage objects, often used to verify what APIs report.                                                                                                                      |
+If provisioning new storage for replicated servers, ensure:
+
+1. Create primary LDEVs on both arrays (matching capacity & pool type).
+2. Register in same replication group.
+3. Create LU paths on both sides.
+4. Start pair creation via Admin API `POST /v1/replications` or via CCI `paircreate`.
 
 ---
 
-Would you like me to merge this glossary directly into the full Markdown doc so you have a single cohesive file ready for sharing?
+# 🧩 Part 2 — Data-modeling attributes (#DATA)
 
+To persist topology and configuration, model each entity and its key attributes.
+
+| Entity            | Key Attributes                                                                                         | Description             |
+| ----------------- | ------------------------------------------------------------------------------------------------------ | ----------------------- |
+| **StorageSystem** | `storageSystemId`, `model`, `serialNumber`, `microcodeVersion`                                         | Top-level array         |
+| **Pool**          | `poolId`, `raidType`, `totalCapacity`, `availableCapacity`                                             | Capacity source         |
+| **ParityGroup**   | `parityGroupId`, `raidLevel`, `driveType`, `speed`                                                     | RAID backend            |
+| **Volume (LDEV)** | `ldevId`, `sizeMB`, `poolId`, `parityGroupId`, `replicationType`, `replicationGroupId`, `pairVolumeId` | Logical volume metadata |
+| **Port**          | `storagePortId`, `portMode`, `wwn`, `protocol`                                                         | Front-end port          |
+| **HostGroup**     | `hostGroupId`, `portId`, `hostMode`, `hostModeOptions`, `initiators[]`                                 | Presentation group      |
+| **LUN Path**      | `lunId`, `hostGroupId`, `ldevId`, `pathStatus`                                                         | Join object             |
+| **Server**        | `serverId`, `hostname`, `osType`, `clusterGroup`, `isReplicated`                                       | Host metadata           |
+| **Replication**   | `replicationType`, `replicationGroupId`, `journalId`, `pairStatus`, `primaryLdevId`, `secondaryLdevId` | Pairing configuration   |
+
+These attributes allow you to build a normalized data model that matches Ops Center’s internal schema and supports both replicated and non-replicated provisioning workflows.
+
+---
+
+## 📘 References
+
+* [Ops Center Admin API Guide](https://knowledge.hitachivantara.com/Documents/Management_Software/Ops_Center/API)
+* [Ops Center Configuration Manager REST API Guide](https://knowledge.hitachivantara.com/Documents/Management_Software/Ops_Center/Configuration_Manager)
+* [Ops Center Analyzer Detail View Guide (MQL)](https://knowledge.hitachivantara.com/)
+* [Command Control Interface Manual](https://knowledge.hitachivantara.com/Documents/Management_Software/Command_Control_Interface)
+
+---
+
+### ✅ Summary
+
+* Use **Admin API** for integrated host/volume discovery.
+* Use **CMREST** for replication and low-level array state.
+* Capture key attributes (pool, parity group, replication group, etc.) into your data model for consistent provisioning and reporting.
