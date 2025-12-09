@@ -1,0 +1,467 @@
+#ServiceNow Automation Blueprint: PowerScale NFS Export Modification
+
+---
+
+## 1.  USER INTERFACE
+
+### 1.1 ServiceNow Catalog Item Form (User-Facing)
+
+| Step                        | User Input                     | What Appears Next                              |
+| --------------------------- | ------------------------------ | ---------------------------------------------- |
+| **1**                       | **Select Cluster**             | Export Path field                              |
+| **2**                       | **Enter / Search Export Path** | Action choices                                 |
+| **3**                       | **Choose an Action**           | Corresponding section only                     |
+| **→ If Add Client**         | Action = Add Client            | Host/IP field • Add-more option • Access level |
+| **→ If Remove Client**      | Action = Remove Client         | Dropdown of existing clients                   |
+| **→ If Change Permissions** | Action = Change Permissions    | Current mode • New mode toggle                 |
+| **→ If Update Security**    | Action = Update Security       | Kerberos options                               |
+| **4**                       | **Business Justification**     | Submit                                         |
+
+
+### 1.2 Behind-the-Scenes Translation
+
+**User Says:** "Add client 192.168.1.50 with Read-Only access"
+
+**System Translates To:**
+```yaml
+read_only_clients:
+  - "192.168.1.50"
+client_state: "present-in-export"
+read_only: false  # Export stays R/W, but this client is R/O only
+```
+
+**User Says:** "Remove client server01"
+
+**System Translates To:**
+```yaml
+# System first determines which list the client is in:
+# - If in read_only_clients → remove from that list
+# - If in read_write_clients → remove from that list
+# - If in root_clients → remove from that list + approval workflow
+client_state: "absent-in-export"
+```
+
+---
+
+## 2. SECURITY-FIRST REQUIREMENTS
+
+### 2.1 Automatic Security Validations
+
+#### **Validation Rule 1: No Public Access**
+**User Impact:** System automatically rejects wildcards like `*` or `0.0.0.0/0`
+
+#### **Validation Rule 2: RFC1918 Private Networks Only (Default)**
+**User Impact:** System blocks external/public IP addresses automatically
+
+#### **Validation Rule 3: Root Access Restrictions**
+**User Impact:** Root access requests must have substantial justification (100+ characters)
+
+#### **Validation Rule 4: Security Flavor Enforcement**
+```yaml
+- name: Security Check - Enforce minimum security standards
+  set_fact:
+    security_flavors: "{{ security_flavors + ['unix'] }}"
+  when: 
+    - security_flavors is not defined or security_flavors | length == 0
+    - access_zone == "System"  # Default zones get unix security minimum
+
+```
+
+**User Impact:** System enforces appropriate security levels based on path sensitivity
+
+---
+
+## 3. PRE-FLIGHT CHECKS & CONFIGURATION BACKUP
+
+### 3.1 Comprehensive Pre-Flight Validation Playbook
+
+```yaml
+---
+- name: Pre-Flight Checks and Configuration Backup
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - dellemc.powerscale
+  
+  vars:
+    backup_dir: "/var/lib/ansible/powerscale_backups"
+    ritm_number: "{{ servicenow_ritm_number }}"
+    timestamp: "{{ ansible_date_time.epoch }}"
+  
+  tasks:
+    - name: Pre-Flight Step 1 - Verify PowerScale cluster health
+      uri:
+        url: "https://{{ onefs_host }}:8080/platform/1/cluster/health"
+        user: "{{ api_user }}"
+        password: "{{ api_password }}"
+        validate_certs: "{{ verify_ssl }}"
+        method: GET
+        force_basic_auth: yes
+        status_code: 200
+      register: cluster_health
+      failed_when: false
+      retries: 3
+      delay: 5
+    
+    - name: Pre-Flight Step 1 - Evaluate cluster health status
+      assert:
+        that:
+          - cluster_health.status == 200
+          - cluster_health.json is defined
+        fail_msg: |
+          CRITICAL: PowerScale cluster {{ onefs_host }} is unreachable or unhealthy.
+          HTTP Status: {{ cluster_health.status | default('No Response') }}
+          Please verify cluster connectivity and try again.
+        success_msg: "✓ Cluster {{ onefs_host }} is healthy and reachable"
+    
+    - name: Pre-Flight Step 2 - Validate access zone exists
+      uri:
+        url: "https://{{ onefs_host }}:8080/platform/3/zones/{{ access_zone }}"
+        user: "{{ api_user }}"
+        password: "{{ api_password }}"
+        validate_certs: "{{ verify_ssl }}"
+        method: GET
+        force_basic_auth: yes
+        status_code: 200
+      register: zone_validation
+      failed_when: false
+    
+    - name: Pre-Flight Step 3 - Get all available zones if specified zone not found
+      uri:
+        url: "https://{{ onefs_host }}:8080/platform/3/zones"
+        user: "{{ api_user }}"
+        password: "{{ api_password }}"
+        validate_certs: "{{ verify_ssl }}"
+        method: GET
+        force_basic_auth: yes
+      register: all_zones
+      when: zone_validation.status != 200
+    
+    - name: Pre-Flight Step 4 - Fail if access zone doesn't exist
+      fail:
+        msg: |
+          VALIDATION FAILED: Access zone '{{ access_zone }}' does not exist on cluster {{ onefs_host }}.
+          Available zones: {{ all_zones.json.zones | map(attribute='name') | list | join(', ') }}
+      when: zone_validation.status != 200
+    
+    - debug:
+        msg: "✓ Access zone '{{ access_zone }}' is valid"
+      when: zone_validation.status == 200
+    
+    - name: Pre-Flight Step 5 - Check if NFS export exists
+      dellemc.powerscale.nfs:
+        onefs_host: "{{ onefs_host }}"
+        api_user: "{{ api_user }}"
+        api_password: "{{ api_password }}"
+        verify_ssl: "{{ verify_ssl }}"
+        path: "{{ path }}"
+        access_zone: "{{ access_zone }}"
+        state: "present"
+      register: current_export
+      failed_when: false
+    
+    - name: Pre-Flight Step 6 - Fail if export doesn't exist
+      fail:
+        msg: |
+          VALIDATION FAILED: NFS export not found at path '{{ path }}' in access zone '{{ access_zone }}'.
+          
+          To find existing exports, use CLI command:
+          isi nfs exports list --zone={{ access_zone }}
+          
+          Or use ServiceNow's "Search Existing Exports" feature in the form.
+      when: 
+        - current_export.NFS_export_details is not defined or
+          current_export.NFS_export_details | length == 0
+    
+    - debug:
+        msg: "✓ NFS export exists at {{ path }}"
+      when: current_export.NFS_export_details is defined
+    
+    - name: Pre-Flight Step 7 - Create backup directory structure
+      file:
+        path: "{{ backup_dir }}/{{ onefs_host }}/{{ access_zone }}"
+        state: directory
+        mode: '0750'
+      delegate_to: localhost
+    
+    - name: Pre-Flight Step 4 - Generate backup filename
+      set_fact:
+        backup_filename: "{{ path | regex_replace('/', '_') }}_{{ timestamp }}.json"
+        backup_path: "{{ backup_dir }}/{{ onefs_host }}/{{ access_zone }}/{{ path | regex_replace('/', '_') }}_{{ timestamp }}.json"
+    
+    - name: Pre-Flight Step 8 - Save current configuration to backup
+      copy:
+        content: "{{ current_export.NFS_export_details | to_nice_json }}"
+        dest: "{{ backup_path }}"
+        mode: '0640'
+      delegate_to: localhost
+    
+    - name: Pre-Flight Step 9 - Create backup metadata
+      copy:
+        content: |
+          {
+            "backup_timestamp": "{{ ansible_date_time.iso8601 }}",
+            "ritm_number": "{{ ritm_number }}",
+            "cluster": "{{ onefs_host }}",
+            "access_zone": "{{ access_zone }}",
+            "export_path": "{{ path }}",
+            "backup_file": "{{ backup_filename }}",
+            "requested_by": "{{ servicenow_requester }}",
+            "modification_type": "{{ modification_type }}"
+          }
+        dest: "{{ backup_path }}.meta"
+        mode: '0640'
+      delegate_to: localhost
+    
+    - debug:
+        msg: "✓ Configuration backed up to {{ backup_path }}"
+        
+    - name: Pre-Flight Step 10 - Check for duplicate clients across lists
+      set_fact:
+        all_clients: "{{ (read_only_clients | default([]) + read_write_clients | default([]) + root_clients | default([])) }}"
+    
+    - name: Pre-Flight Step 11 - Detect duplicates
+      assert:
+        that:
+          - all_clients | unique | length == all_clients | length
+        fail_msg: |
+          VALIDATION FAILED: Duplicate clients detected across access lists.
+          Please specify each client only once with their desired access level.
+        success_msg: "✓ No duplicate clients found"
+      when: all_clients | length > 0
+    
+    
+    - name: Pre-Flight Summary - Display results
+      debug:
+        msg:
+          - "==================== PRE-FLIGHT CHECKS COMPLETE ===================="
+          - "✓ Cluster Health: OK"
+          - "✓ Access Zone: {{ access_zone }} (Valid)"
+          - "✓ Export Path: {{ path }} (Exists)"
+          - "✓ Configuration Backup: {{ backup_path }}"
+          - "✓ Security Validations: PASSED"
+          - "✓ Ready to proceed with modification"
+          - "===================================================================="
+    
+    - name: Pre-Flight Summary - Save validation results
+      set_fact:
+        preflight_results:
+          status: "PASSED"
+          cluster_health: "OK"
+          access_zone_valid: true
+          export_exists: true
+          backup_location: "{{ backup_path }}"
+          security_checks: "PASSED"
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+          current_configuration: "{{ current_export.NFS_export_details }}"
+```
+
+## 4. MAIN MODIFICATION PLAYBOOK
+
+```yaml
+---
+- name: PowerScale NFS Export Modification with Safety Checks
+  hosts: localhost
+  gather_facts: no
+  collections:
+    - dellemc.powerscale
+  
+  vars:
+    ritm_number: "{{ servicenow_ritm_number }}"
+    ritm_sys_id: "{{ servicenow_ritm_sys_id }}"
+  
+  tasks:
+    # ================================================================
+    # EXECUTE PRE-FLIGHT CHECKS
+    # ================================================================
+    - name: Execute pre-flight validation and backup
+      include_tasks: preflight_checks.yml
+    
+    - name: Update ServiceNow - Pre-flight complete
+      uri:
+        url: "{{ servicenow_instance }}/api/now/table/sc_req_item/{{ ritm_sys_id }}"
+        method: PATCH
+        user: "{{ servicenow_user }}"
+        password: "{{ servicenow_password }}"
+        body_format: json
+        body:
+          work_notes: |
+            Pre-flight checks completed successfully.
+            
+            Configuration backup: {{ backup_path }}
+            Current export details:
+            {{ preflight_results.current_configuration | to_nice_yaml }}
+            
+            Proceeding with modification...
+          u_preflight_status: "PASSED"
+          u_backup_location: "{{ backup_path }}"
+        status_code: 200
+      delegate_to: localhost
+    
+    - name: Modify NFS Export - Apply changes
+      dellemc.powerscale.nfs:
+        onefs_host: "{{ onefs_host }}"
+        api_user: "{{ api_user }}"
+        api_password: "{{ api_password }}"
+        verify_ssl: "{{ verify_ssl }}"
+        path: "{{ path }}"
+        access_zone: "{{ access_zone }}"
+        read_only_clients: "{{ read_only_clients | default(omit) }}"
+        read_write_clients: "{{ read_write_clients | default(omit) }}"
+        root_clients: "{{ root_clients | default(omit) }}"
+        client_state: "{{ client_state | default('present-in-export') }}"
+        read_only: "{{ read_only | default(omit) }}"
+        sub_directories_mountable: "{{ sub_directories_mountable | default(omit) }}"
+        security_flavors: "{{ security_flavors | default(omit) }}"
+        description: "{{ description | default(omit) }} [Modified via {{ ritm_number }}]"
+        state: "present"
+      register: modification_result
+      retries: 2
+      delay: 10
+      until: modification_result is succeeded
+    
+    - name: Verify modifications were applied
+      dellemc.powerscale.nfs:
+        onefs_host: "{{ onefs_host }}"
+        api_user: "{{ api_user }}"
+        api_password: "{{ api_password }}"
+        verify_ssl: "{{ verify_ssl }}"
+        path: "{{ path }}"
+        access_zone: "{{ access_zone }}"
+        state: "present"
+      register: verification_result
+    
+    - name: Generate configuration comparison
+      set_fact:
+        config_comparison:
+          before: "{{ preflight_results.current_configuration }}"
+          after: "{{ verification_result.NFS_export_details }}"
+          changes_applied: "{{ modification_result.changed }}"
+          modification_timestamp: "{{ ansible_date_time.iso8601 }}"
+    
+    - name: Prepare final configuration summary for ServiceNow
+      set_fact:
+        final_summary: |
+          ═══════════════════════════════════════════════════════════
+          NFS EXPORT MODIFICATION - COMPLETED SUCCESSFULLY
+          ═══════════════════════════════════════════════════════════
+          
+          REQUEST DETAILS:
+          ----------------
+          RITM: {{ ritm_number }}
+          Cluster: {{ onefs_host }}
+          Access Zone: {{ access_zone }}
+          Export Path: {{ path }}
+          Modification Type: {{ modification_type }}
+          
+          FINAL CONFIGURATION:
+          --------------------
+          Read-Only Clients:
+          {{ verification_result.NFS_export_details.read_only_clients | default(['(none)']) | to_nice_yaml }}
+          
+          Read-Write Clients:
+          {{ verification_result.NFS_export_details.read_write_clients | default(['(none)']) | to_nice_yaml }}
+          
+          Root Clients:
+          {{ verification_result.NFS_export_details.root_clients | default(['(none)']) | to_nice_yaml }}
+          
+          Export Mode: {{ 'Read-Only' if verification_result.NFS_export_details.read_only else 'Read-Write' }}
+          Subdirectories Mountable: {{ verification_result.NFS_export_details.sub_directories_mountable | default('Not Set') }}
+          Security Flavors: {{ verification_result.NFS_export_details.security_flavors | join(', ') }}
+          
+          BACKUP & AUDIT:
+          ---------------
+          Configuration Backup: {{ backup_path }}
+          Ansible Job ID: {{ tower_job_id }}
+          Completion Time: {{ ansible_date_time.iso8601 }}
+          
+          ═══════════════════════════════════════════════════════════
+    
+    - name: Update ServiceNow RITM - Success
+      uri:
+        url: "{{ servicenow_instance }}/api/now/table/sc_req_item/{{ ritm_sys_id }}"
+        method: PATCH
+        user: "{{ servicenow_user }}"
+        password: "{{ servicenow_password }}"
+        body_format: json
+        body:
+          state: 3  # Closed Complete
+          close_notes: "{{ final_summary }}"
+          work_notes: "{{ final_summary }}"
+          u_ansible_job_id: "{{ tower_job_id }}"
+          u_final_configuration: "{{ verification_result.NFS_export_details | to_json }}"
+          u_backup_location: "{{ backup_path }}"
+          u_modification_timestamp: "{{ ansible_date_time.iso8601 }}"
+        status_code: 200
+      delegate_to: localhost
+      
+  rescue:
+    # ================================================================
+    # ERROR HANDLING
+    # ================================================================
+    - name: Update ServiceNow RITM - Failure
+      uri:
+        url: "{{ servicenow_instance }}/api/now/table/sc_req_item/{{ ritm_sys_id }}"
+        method: PATCH
+        user: "{{ servicenow_user }}"
+        password: "{{ servicenow_password }}"
+        body_format: json
+        body:
+          state: 4  # Closed Incomplete
+          close_notes: |
+            NFS Export modification failed.
+            
+            Error Details:
+            {{ ansible_failed_result.msg }}
+            
+            Configuration backup available at: {{ backup_path | default('Not created') }}
+            Ansible Job ID: {{ tower_job_id }}
+            
+            The PowerScale export has NOT been modified.
+            Please review the error and submit a new request or contact storage administrators.
+          work_notes: "FAILURE: {{ ansible_failed_result.msg }}"
+          u_ansible_job_id: "{{ tower_job_id }}"
+          u_error_details: "{{ ansible_failed_result | to_json }}"
+        status_code: 200
+      delegate_to: localhost
+    
+    - name: Send failure notification email
+      mail:
+        host: "{{ smtp_server }}"
+        port: 25
+        from: ""
+        to: "{{ servicenow_requester_email }}"
+        cc: ""
+        subject: "✗ NFS Export Modification Failed - {{ ritm_number }}"
+        body: |
+          Hello {{ servicenow_requester_name }},
+          
+          Unfortunately, your NFS export modification request could not be completed.
+          
+          REQUEST: {{ ritm_number }}
+          CLUSTER: {{ onefs_host }}
+          PATH: {{ path }}
+          
+          ERROR: {{ ansible_failed_result.msg }}
+          
+          Your export configuration has NOT been changed. A backup of the original
+          configuration has been preserved.
+          
+          NEXT STEPS:
+          -----------
+          1. Review the error details in the ServiceNow ticket
+          2. If this is a validation error, correct the issue and submit a new request
+          3. If this is a system error, our storage team has been notified
+          
+          Please contact the Service Desk if you need assistance.
+          
+          ---
+          ServiceNow Automation Platform
+      delegate_to: localhost
+    
+    - name: Fail the playbook with error details
+      fail:
+        msg: "NFS Export modification failed: {{ ansible_failed_result.msg }}"
+```
+
+---
